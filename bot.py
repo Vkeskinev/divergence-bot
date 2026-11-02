@@ -6,13 +6,19 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ROLLING = 100
-MIN_DROP_PCT = 10.0  # Сложи 20.0 за production
-MIN_DELTA_PCT = 10.0 # Сложи 25.0 за production
+MIN_DROP_PCT = 20.0
+MIN_DELTA_PCT = 25.0
 
-SYMBOLS = {"EURCAD":"EURCAD=X","EURUSD":"EURUSD=X","GBPUSD":"GBPUSD=X","USDJPY":"USDJPY=X","AUDUSD":"AUDUSD=X","USDCAD":"USDCAD=X","GBPJPY":"GBPJPY=X","EURJPY":"EURJPY=X","XAUUSD":"GC=F","XAGUSD":"SI=F","SP500":"^GSPC","NASDAQ":"^IXIC","DAX":"^GDAXI"}
-TFS = [("1m","1d","1m"),("5m","5d","5m"),("15m","5d","15m"),("1h","1mo","60m"),("4h","3mo","60m"),("1D","1y","1d")]
+SYMBOLS = {
+    "EURCAD": "EURCAD=X", "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X",
+    "USDJPY": "USDJPY=X", "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X",
+    "GBPJPY": "GBPJPY=X", "EURJPY": "EURJPY=X", "XAUUSD": "GC=F", "XAGUSD": "SI=F",
+    "SP500": "^GSPC", "NASDAQ": "^IXIC", "DAX": "^GDAXI"
+}
+TFS = [("15m","5d","15m"),("1h","1mo","60m"),("4h","3mo","60m"),("1D","1y","1d")]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+sent_cache = set()
 
 def calc(df, rolling=100):
     if 'Volume' not in df.columns or df['Volume'].sum()==0: df['Volume']=1_000_000
@@ -58,6 +64,7 @@ def detect_both(df):
     return None
 
 async def scan(bot, name, ticker, tf_label, period, interval):
+    global sent_cache
     try:
         df=yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, threads=False)
         if df.empty: 
@@ -68,6 +75,12 @@ async def scan(bot, name, ticker, tf_label, period, interval):
         df=calc(df, ROLLING); df.dropna(inplace=True)
         sig=detect_both(df)
         if sig:
+            key = f"{name}_{tf_label}_{sig['time']}"
+            if key in sent_cache:
+                logging.info(f"Scan {name} {tf_label} - duplicate skipped {sig['time']}")
+                return
+            sent_cache.add(key)
+            if len(sent_cache) > 200: sent_cache.clear()
             msg=f"{sig['title']}\n\n📊 *{name}* | TF: *{tf_label}* | Rolling {ROLLING}\n💰 Цена: `{sig['price1']:.5f}` → `{sig['price2']:.5f}`\n📦 Обем: `{sig['vol1']:,.0f}` → `{sig['vol2']:,.0f}` (-{sig['drop']:.1f}%)\n🟠 Delta: `{sig['delta_max']:,.0f}` → `{sig['delta_curr']:,.0f}` (-{sig['delta_drop']:.1f}%)\n🕐 {sig['time']}"
             await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
             logging.info(f"SIGNAL {name} {tf_label} {sig['type']} {sig['drop']:.1f}%")
@@ -81,8 +94,8 @@ async def main_bot():
         logging.warning("⚠️ Няма токени")
         while True: await asyncio.sleep(3600)
     bot=Bot(token=BOT_TOKEN)
-    await bot.send_message(chat_id=CHAT_ID, text=f"✅ *V4.1 LIVE*\nПрагове: {MIN_DROP_PCT}% / {MIN_DELTA_PCT}%\nФиксиран HTTP + Heartbeat", parse_mode='Markdown')
-    logging.info("Bot started V4.1")
+    await bot.send_message(chat_id=CHAT_ID, text=f"✅ *V4.2 FINAL LIVE*\nПрагове: обем ≥{MIN_DROP_PCT}% Delta ≥{MIN_DELTA_PCT}%\nTF: 15m, 1h, 4h, 1D\nАнти-спам активен - работи 24/7!", parse_mode='Markdown')
+    logging.info("Bot V4.2 FINAL started")
     while True:
         for tf_label,period,interval in TFS:
             for name,ticker in SYMBOLS.items():
@@ -94,11 +107,10 @@ async def main_bot():
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path == "/health":
-            self.send_response(200); self.end_headers(); self.wfile.write(b"Bot OK - V4.1")
+            self.send_response(200); self.end_headers(); self.wfile.write(b"Bot V4.2 FINAL OK")
         else:
             self.send_response(404); self.end_headers(); self.wfile.write(b"Not Found")
-    def log_message(self, format, *args):
-        return  # Спира спама от /wp-admin скенерите
+    def log_message(self, format, *args): return
 
 def run_http():
     port=int(os.environ.get("PORT",10000))
