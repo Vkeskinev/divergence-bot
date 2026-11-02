@@ -6,22 +6,16 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ROLLING = 100
-MIN_DROP_PCT = 20.0
-MIN_DELTA_PCT = 25.0
+MIN_DROP_PCT = 10.0  # Сложи 20.0 за production
+MIN_DELTA_PCT = 10.0 # Сложи 25.0 за production
 
-SYMBOLS = {
-    "EURCAD": "EURCAD=X", "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X", "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X",
-    "GBPJPY": "GBPJPY=X", "EURJPY": "EURJPY=X", "XAUUSD": "GC=F", "XAGUSD": "SI=F",
-    "SP500": "^GSPC", "NASDAQ": "^IXIC", "DAX": "^GDAXI"
-}
+SYMBOLS = {"EURCAD":"EURCAD=X","EURUSD":"EURUSD=X","GBPUSD":"GBPUSD=X","USDJPY":"USDJPY=X","AUDUSD":"AUDUSD=X","USDCAD":"USDCAD=X","GBPJPY":"GBPJPY=X","EURJPY":"EURJPY=X","XAUUSD":"GC=F","XAGUSD":"SI=F","SP500":"^GSPC","NASDAQ":"^IXIC","DAX":"^GDAXI"}
 TFS = [("1m","1d","1m"),("5m","5d","5m"),("15m","5d","15m"),("1h","1mo","60m"),("4h","3mo","60m"),("1D","1y","1d")]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
 def calc(df, rolling=100):
-    if 'Volume' not in df.columns or df['Volume'].sum()==0:
-        df['Volume']=1_000_000
+    if 'Volume' not in df.columns or df['Volume'].sum()==0: df['Volume']=1_000_000
     df['buyVol']=np.where(df['Close']>=df['Open'], df['Volume'],0)
     df['sellVol']=np.where(df['Close']<df['Open'], df['Volume'],0)
     df['cumBuy']=df['buyVol'].rolling(rolling).sum()
@@ -67,44 +61,49 @@ async def scan(bot, name, ticker, tf_label, period, interval):
     try:
         df=yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, threads=False)
         if df.empty: 
-            logging.info(f"Scan {name} {tf_label} - empty data")
+            logging.info(f"Scan {name} {tf_label} - empty")
             return
         if isinstance(df.columns, pd.MultiIndex): df.columns=df.columns.get_level_values(0)
         if tf_label=="4h": df=df.resample('4h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
         df=calc(df, ROLLING); df.dropna(inplace=True)
         sig=detect_both(df)
         if sig:
-            msg=(f"{sig['title']}\n\n📊 *{name}* | TF: *{tf_label}* | Rolling {ROLLING}\n💰 Цена: `{sig['price1']:.5f}` → `{sig['price2']:.5f}`\n📦 Обем: `{sig['vol1']:,.0f}` → `{sig['vol2']:,.0f}` (-{sig['drop']:.1f}%)\n🟠 Delta: `{sig['delta_max']:,.0f}` → `{sig['delta_curr']:,.0f}` (-{sig['delta_drop']:.1f}%)\n🕐 {sig['time']}")
+            msg=f"{sig['title']}\n\n📊 *{name}* | TF: *{tf_label}* | Rolling {ROLLING}\n💰 Цена: `{sig['price1']:.5f}` → `{sig['price2']:.5f}`\n📦 Обем: `{sig['vol1']:,.0f}` → `{sig['vol2']:,.0f}` (-{sig['drop']:.1f}%)\n🟠 Delta: `{sig['delta_max']:,.0f}` → `{sig['delta_curr']:,.0f}` (-{sig['delta_drop']:.1f}%)\n🕐 {sig['time']}"
             await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-            logging.info(f"SIGNAL {name} {tf_label} {sig['type']} drop {sig['drop']:.1f}%")
+            logging.info(f"SIGNAL {name} {tf_label} {sig['type']} {sig['drop']:.1f}%")
         else:
             logging.info(f"Scan {name} {tf_label} - no signal")
     except Exception as e:
-        logging.error(f"{name} {tf_label} ERROR {e}")
+        logging.error(f"{name} {tf_label} {e}")
 
 async def main_bot():
     if not BOT_TOKEN or not CHAT_ID:
         logging.warning("⚠️ Няма токени")
         while True: await asyncio.sleep(3600)
     bot=Bot(token=BOT_TOKEN)
-    await bot.send_message(chat_id=CHAT_ID, text=f"✅ *V4 FREE стартира на Render*\nБезплатен план, работи 24/7\nПрагове: обем ≥{MIN_DROP_PCT}% Delta ≥{MIN_DELTA_PCT}%\nСканирам: EUR, злато, индекси... TF: 1m-1D\nЛогове ще има на всяка минута!", parse_mode='Markdown')
-    logging.info("Bot started - beginning scan loop")
+    await bot.send_message(chat_id=CHAT_ID, text=f"✅ *V4.1 LIVE*\nПрагове: {MIN_DROP_PCT}% / {MIN_DELTA_PCT}%\nФиксиран HTTP + Heartbeat", parse_mode='Markdown')
+    logging.info("Bot started V4.1")
     while True:
         for tf_label,period,interval in TFS:
             for name,ticker in SYMBOLS.items():
                 await scan(bot,name,ticker,tf_label,period,interval)
                 await asyncio.sleep(1)
-        logging.info("--- Full cycle done, sleep 60s ---")
+        logging.info("--- Cycle done, sleep 60s ---")
         await asyncio.sleep(60)
 
-class Handler(http.server.SimpleHTTPRequestHandler):
+class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"Bot is running - Divergence V4 FREE 20%/25%")
+        if self.path == "/" or self.path == "/health":
+            self.send_response(200); self.end_headers(); self.wfile.write(b"Bot OK - V4.1")
+        else:
+            self.send_response(404); self.end_headers(); self.wfile.write(b"Not Found")
+    def log_message(self, format, *args):
+        return  # Спира спама от /wp-admin скенерите
 
 def run_http():
     port=int(os.environ.get("PORT",10000))
     with socketserver.TCPServer(("",port), Handler) as httpd:
-        logging.info(f"HTTP server on port {port}")
+        logging.info(f"HTTP on port {port}")
         httpd.serve_forever()
 
 if __name__=="__main__":
