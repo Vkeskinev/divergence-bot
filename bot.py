@@ -1,45 +1,105 @@
 import os, asyncio, threading, logging, http.server, socketserver
+import pandas as pd, numpy as np, yfinance as yf
 from telegram import Bot
-import random
 from datetime import datetime
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+ROLLING = 100
+MIN_DROP_PCT = 20.0
+MIN_DELTA_PCT = 25.0
+
+SYMBOLS = {
+    "EURCAD": "EURCAD=X", "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X",
+    "USDJPY": "USDJPY=X", "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X",
+    "GBPJPY": "GBPJPY=X", "EURJPY": "EURJPY=X", "XAUUSD": "GC=F", "XAGUSD": "SI=F",
+    "SP500": "^GSPC", "NASDAQ": "^IXIC", "DAX": "^GDAXI"
+}
+TFS = [("1m","1d","1m"),("5m","5d","5m"),("15m","5d","15m"),("1h","1mo","60m"),("4h","3mo","60m"),("1D","1y","1d")]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
+def calc(df, rolling=100):
+    if 'Volume' not in df.columns or df['Volume'].sum()==0:
+        df['Volume']=1_000_000
+    df['buyVol']=np.where(df['Close']>=df['Open'], df['Volume'],0)
+    df['sellVol']=np.where(df['Close']<df['Open'], df['Volume'],0)
+    df['cumBuy']=df['buyVol'].rolling(rolling).sum()
+    df['cumSell']=df['sellVol'].rolling(rolling).sum()
+    df['delta']=df['cumBuy']-df['cumSell']
+    return df
+
+def pivots(arr, left=5, right=3):
+    highs=[]; lows=[]
+    for i in range(left, len(arr)-right):
+        w=arr[i-left:i+right+1]
+        if arr[i]==np.max(w) and arr[i]>0: highs.append(i)
+        if arr[i]==np.min(w) and arr[i]>0: lows.append(i)
+    return highs,lows
+
+def detect_both(df):
+    if len(df)<ROLLING+50: return None
+    high=df['High'].values; low=df['Low'].values
+    cumBuy=df['cumBuy'].values; cumSell=df['cumSell'].values; delta=df['delta'].values
+    ph_high = pivots(high)[0]; pl_low = pivots(low)[1]
+    ph_buy = pivots(cumBuy)[0]; ph_sell = pivots(cumSell)[0]
+    if len(ph_high)>=2 and len(ph_buy)>=2:
+        p1,p2=ph_high[-2],ph_high[-1]; b1,b2=ph_buy[-2],ph_buy[-1]
+        if abs(p2-b2)<=7 and len(df)-p2<=12 and high[p2]>high[p1] and cumBuy[b2]<cumBuy[b1]:
+            drop=(cumBuy[b1]-cumBuy[b2])/cumBuy[b1]*100 if cumBuy[b1]>0 else 0
+            if drop>=MIN_DROP_PCT:
+                max_delta=np.max(delta[max(0,b1-30):b1+1])
+                delta_drop=(max_delta-delta[b2])/max_delta*100 if max_delta>0 else 0
+                if delta_drop>=MIN_DELTA_PCT:
+                    return {"type":"BEARISH","title":"🔴 МЕЧИ РАЗПРЕДЕЛЕНИЕ","price1":high[p1],"price2":high[p2],"vol1":cumBuy[b1],"vol2":cumBuy[b2],"drop":drop,"delta_max":max_delta,"delta_curr":delta[b2],"delta_drop":delta_drop,"time":df.index[p2]}
+    if len(pl_low)>=2 and len(ph_sell)>=2:
+        p1,p2=pl_low[-2],pl_low[-1]; s1,s2=ph_sell[-2],ph_sell[-1]
+        if abs(p2-s2)<=7 and len(df)-p2<=12 and low[p2]<low[p1] and cumSell[s2]<cumSell[s1]:
+            drop=(cumSell[s1]-cumSell[s2])/cumSell[s1]*100 if cumSell[s1]>0 else 0
+            if drop>=MIN_DROP_PCT:
+                min_delta=np.min(delta[max(0,s1-30):s1+1])
+                delta_rise=(delta[s2]-min_delta)/abs(min_delta)*100 if min_delta!=0 else 0
+                if delta_rise>=MIN_DELTA_PCT or delta[s2]>min_delta:
+                    return {"type":"BULLISH","title":"🟢 БИЧИ НАТРУПВАНЕ","price1":low[p1],"price2":low[p2],"vol1":cumSell[s1],"vol2":cumSell[s2],"drop":drop,"delta_max":min_delta,"delta_curr":delta[s2],"delta_drop":delta_rise,"time":df.index[p2]}
+    return None
+
+async def scan(bot, name, ticker, tf_label, period, interval):
+    try:
+        df=yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, threads=False)
+        if df.empty: 
+            logging.info(f"Scan {name} {tf_label} - empty data")
+            return
+        if isinstance(df.columns, pd.MultiIndex): df.columns=df.columns.get_level_values(0)
+        if tf_label=="4h": df=df.resample('4h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+        df=calc(df, ROLLING); df.dropna(inplace=True)
+        sig=detect_both(df)
+        if sig:
+            msg=(f"{sig['title']}\n\n📊 *{name}* | TF: *{tf_label}* | Rolling {ROLLING}\n💰 Цена: `{sig['price1']:.5f}` → `{sig['price2']:.5f}`\n📦 Обем: `{sig['vol1']:,.0f}` → `{sig['vol2']:,.0f}` (-{sig['drop']:.1f}%)\n🟠 Delta: `{sig['delta_max']:,.0f}` → `{sig['delta_curr']:,.0f}` (-{sig['delta_drop']:.1f}%)\n🕐 {sig['time']}")
+            await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
+            logging.info(f"SIGNAL {name} {tf_label} {sig['type']} drop {sig['drop']:.1f}%")
+        else:
+            logging.info(f"Scan {name} {tf_label} - no signal")
+    except Exception as e:
+        logging.error(f"{name} {tf_label} ERROR {e}")
+
 async def main_bot():
     if not BOT_TOKEN or not CHAT_ID:
-        logging.warning("⚠️ Няма токени - чакам в Environment")
-        while True:
-            await asyncio.sleep(3600)
-    
+        logging.warning("⚠️ Няма токени")
+        while True: await asyncio.sleep(3600)
     bot=Bot(token=BOT_TOKEN)
-    
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=f"✅ TEST LIVE е стартиран!\nВреме: {datetime.now()}\nЩе пращам фалшив сигнал на всеки 2 мин за да проверим Telegram.", parse_mode='Markdown')
-        logging.info("Telegram test message sent!")
-    except Exception as e:
-        logging.error(f"Telegram error {e}")
-
-    counter = 0
+    await bot.send_message(chat_id=CHAT_ID, text=f"✅ *V4 FREE стартира на Render*\nБезплатен план, работи 24/7\nПрагове: обем ≥{MIN_DROP_PCT}% Delta ≥{MIN_DELTA_PCT}%\nСканирам: EUR, злато, индекси... TF: 1m-1D\nЛогове ще има на всяка минута!", parse_mode='Markdown')
+    logging.info("Bot started - beginning scan loop")
     while True:
-        counter += 1
-        logging.info(f"Heartbeat #{counter} - bot is alive, scanning... {datetime.now()}")
-        
-        if counter % 2 == 0:
-            try:
-                msg = f"🧪 *TEST СИГНАЛ #{counter//2}*\n\n📊 EURCAD | TF: 15m\n💰 Цена: 1.49800 → 1.49950\n📦 Обем: 1,200,000 → 950,000 (-20.8%)\n🕐 {datetime.now()}\n\nТова е фалшив сигнал за тест!"
-                await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-                logging.info(f"SIGNAL SENT #{counter//2}")
-            except Exception as e:
-                logging.error(f"Send error {e}")
-        
+        for tf_label,period,interval in TFS:
+            for name,ticker in SYMBOLS.items():
+                await scan(bot,name,ticker,tf_label,period,interval)
+                await asyncio.sleep(1)
+        logging.info("--- Full cycle done, sleep 60s ---")
         await asyncio.sleep(60)
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"Bot TEST running - heartbeat every 60s")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"Bot is running - Divergence V4 FREE 20%/25%")
 
 def run_http():
     port=int(os.environ.get("PORT",10000))
