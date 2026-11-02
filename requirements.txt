@@ -1,0 +1,4 @@
+yfinance
+pandas
+numpy
+python-telegram-bot==20.7
