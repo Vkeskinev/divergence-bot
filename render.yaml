@@ -1,13 +1,12 @@
-
 services:
-  - type: worker
+    - type: worker
     name: divergence-bot-v4
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python Telegram_Divergence_Bot_V4_FINAL_BOTH_DIRECTIONS.py
+    startCommand: python bot.py
     envVars:
-      - key: TELEGRAM_BOT_TOKEN
+            - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: TELEGRAM_CHAT_ID
+            - key: TELEGRAM_CHAT_ID
         sync: false
