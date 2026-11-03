@@ -6,8 +6,9 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ROLLING = 100
-MIN_DROP_PCT = 10
-MIN_DELTA_PCT = 10
+MIN_DROP_PCT = 15.0
+MIN_DELTA_PCT = 15.0
+SEND_CYCLE_SUMMARY = True  # Ако спами много, сложи False
 
 SYMBOLS = {
     "EURCAD": "EURCAD=X", "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X",
@@ -15,7 +16,8 @@ SYMBOLS = {
     "GBPJPY": "GBPJPY=X", "EURJPY": "EURJPY=X", "XAUUSD": "GC=F", "XAGUSD": "SI=F",
     "SP500": "^GSPC", "NASDAQ": "^IXIC", "DAX": "^GDAXI"
 }
-TFS = [("15m","5d","15m"),("1h","1mo","60m"),("4h","3mo","60m"),("1D","1y","1d")]
+# V4.3 - ВЪРНАТИ 1m и 5m както искаш
+TFS = [("1m","1d","1m"),("5m","5d","5m"),("15m","5d","15m"),("1h","1mo","60m"),("4h","3mo","60m"),("1D","1y","1d")]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 sent_cache = set()
@@ -69,7 +71,7 @@ async def scan(bot, name, ticker, tf_label, period, interval):
         df=yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, threads=False)
         if df.empty: 
             logging.info(f"Scan {name} {tf_label} - empty")
-            return
+            return 0
         if isinstance(df.columns, pd.MultiIndex): df.columns=df.columns.get_level_values(0)
         if tf_label=="4h": df=df.resample('4h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
         df=calc(df, ROLLING); df.dropna(inplace=True)
@@ -77,47 +79,41 @@ async def scan(bot, name, ticker, tf_label, period, interval):
         if sig:
             key = f"{name}_{tf_label}_{sig['time']}"
             if key in sent_cache:
-                logging.info(f"Scan {name} {tf_label} - duplicate skipped {sig['time']}")
-                return
+                logging.info(f"Scan {name} {tf_label} - duplicate skipped")
+                return 0
             sent_cache.add(key)
             if len(sent_cache) > 200: sent_cache.clear()
             msg=f"{sig['title']}\n\n📊 *{name}* | TF: *{tf_label}* | Rolling {ROLLING}\n💰 Цена: `{sig['price1']:.5f}` → `{sig['price2']:.5f}`\n📦 Обем: `{sig['vol1']:,.0f}` → `{sig['vol2']:,.0f}` (-{sig['drop']:.1f}%)\n🟠 Delta: `{sig['delta_max']:,.0f}` → `{sig['delta_curr']:,.0f}` (-{sig['delta_drop']:.1f}%)\n🕐 {sig['time']}"
             await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
             logging.info(f"SIGNAL {name} {tf_label} {sig['type']} {sig['drop']:.1f}%")
+            return 1
         else:
             logging.info(f"Scan {name} {tf_label} - no signal")
+            return 0
     except Exception as e:
         logging.error(f"{name} {tf_label} {e}")
+        return 0
 
 async def main_bot():
     if not BOT_TOKEN or not CHAT_ID:
         logging.warning("⚠️ Няма токени")
         while True: await asyncio.sleep(3600)
     bot=Bot(token=BOT_TOKEN)
-    await bot.send_message(chat_id=CHAT_ID, text=f"✅ *V4.2 FINAL LIVE*\nПрагове: обем ≥{MIN_DROP_PCT}% Delta ≥{MIN_DELTA_PCT}%\nTF: 15m, 1h, 4h, 1D\nАнти-спам активен - работи 24/7!", parse_mode='Markdown')
-    logging.info("Bot V4.2 FINAL started")
+    await bot.send_message(chat_id=CHAT_ID, text=f"✅ *V4.3 LIVE*\nПрагове: {MIN_DROP_PCT}% / {MIN_DELTA_PCT}%\nTF: 1m, 5m, 15m, 1h, 4h, 1D (върнати!)\nЩе казвам когато няма открити!", parse_mode='Markdown')
+    logging.info("Bot V4.3 started with 1m,5m")
     while True:
+        total_signals = 0
+        total_checks = len(TFS) * len(SYMBOLS)
         for tf_label,period,interval in TFS:
             for name,ticker in SYMBOLS.items():
-                await scan(bot,name,ticker,tf_label,period,interval)
+                sig = await scan(bot,name,ticker,tf_label,period,interval)
+                total_signals += sig
                 await asyncio.sleep(1)
-        logging.info("--- Cycle done, sleep 60s ---")
-        await asyncio.sleep(60)
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/" or self.path == "/health":
-            self.send_response(200); self.end_headers(); self.wfile.write(b"Bot V4.2 FINAL OK")
-        else:
-            self.send_response(404); self.end_headers(); self.wfile.write(b"Not Found")
-    def log_message(self, format, *args): return
-
-def run_http():
-    port=int(os.environ.get("PORT",10000))
-    with socketserver.TCPServer(("",port), Handler) as httpd:
-        logging.info(f"HTTP on port {port}")
-        httpd.serve_forever()
-
-if __name__=="__main__":
-    threading.Thread(target=run_http, daemon=True).start()
-    asyncio.run(main_bot())
+        
+        # ТУК Е НОВОТО - казва когато няма открити
+        if total_signals == 0:
+            msg_log = f"=== ЦИКЪЛ ЗАВЪРШЕН: НЯМА ОТКРИТИ ДИВЕРГЕНЦИИ | Проверени {total_checks} | {datetime.now().strftime('%H:%M:%S')} ==="
+            logging.info(msg_log)
+            if SEND_CYCLE_SUMMARY:
+                try:
+                    await bot.send_message(chat_id=CHAT_ID, text=f"ℹ️ *Цикъл завършен*\nНяма открити дивергенции\nПроверени: {total_checks} (
