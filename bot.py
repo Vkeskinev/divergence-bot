@@ -6,8 +6,8 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ROLLING = 100
-MIN_DROP_PCT = 15.0
-MIN_DELTA_PCT = 15.0
+MIN_DROP_PCT = 10.0
+MIN_DELTA_PCT = 10.0
 SEND_EMPTY_CYCLE = False 
 
 SYMBOLS = {
