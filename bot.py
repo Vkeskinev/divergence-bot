@@ -1,14 +1,14 @@
 import os, asyncio, threading, logging, http.server, socketserver
 import pandas as pd, numpy as np, yfinance as yf
 from telegram import Bot
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ROLLING = 100
 MIN_DROP_PCT = 10.0
 MIN_DELTA_PCT = 10.0
-SEND_EMPTY_CYCLE = False 
+SEND_EMPTY_CYCLE = False
 
 SYMBOLS = {
     "EURCAD": "EURCAD=X", "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X",
@@ -19,10 +19,12 @@ SYMBOLS = {
 TFS = [("1m","1d","1m"),("5m","5d","5m"),("15m","5d","15m"),("1h","1mo","60m"),("4h","3mo","60m"),("1D","1y","1d")]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
-sent_cache = set()
+sent_cache = {}
+CACHE_TTL_HOURS = 12
 
 def calc(df, rolling=100):
-    if 'Volume' not in df.columns or df['Volume'].sum()==0: df['Volume']=1_000_000
+    if 'Volume' not in df.columns or df['Volume'].sum()==0:
+        df['Volume']=1_000_000
     df['buyVol']=np.where(df['Close']>=df['Open'], df['Volume'],0)
     df['sellVol']=np.where(df['Close']<df['Open'], df['Volume'],0)
     df['cumBuy']=df['buyVol'].rolling(rolling).sum()
@@ -67,7 +69,12 @@ def detect_both(df):
 async def scan(bot, name, ticker, tf_label, period, interval):
     global sent_cache
     try:
-        df=yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, threads=False)
+        # почисти стар кеш
+        now = datetime.now()
+        for k in list(sent_cache.keys()):
+            if now - sent_cache[k] > timedelta(hours=CACHE_TTL_HOURS):
+                del sent_cache[k]
+        df=yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, threads=False, timeout=20)
         if df.empty:
             logging.info(f"Scan {name} {tf_label} - empty")
             return 0
@@ -78,10 +85,9 @@ async def scan(bot, name, ticker, tf_label, period, interval):
         if sig:
             key = f"{name}_{tf_label}_{sig['time']}"
             if key in sent_cache:
-                logging.info(f"Scan {name} {tf_label} - duplicate skipped")
+                logging.info(f"Scan {name} {tf_label} - duplicate skipped {sig['time']}")
                 return 0
-            sent_cache.add(key)
-            if len(sent_cache) > 200: sent_cache.clear()
+            sent_cache[key]=now
             msg = f"{sig['title']} | {name} {tf_label} | Price {sig['price1']:.5f} -> {sig['price2']:.5f} | Vol {sig['vol1']:.0f} -> {sig['vol2']:.0f} (-{sig['drop']:.1f}%) | Delta {sig['delta_max']:.0f} -> {sig['delta_curr']:.0f} | Time {sig['time']}"
             await bot.send_message(chat_id=CHAT_ID, text=msg)
             logging.info(f"SIGNAL {name} {tf_label} {sig['type']} {sig['drop']:.1f}%")
@@ -90,46 +96,42 @@ async def scan(bot, name, ticker, tf_label, period, interval):
             logging.info(f"Scan {name} {tf_label} - no signal")
             return 0
     except Exception as e:
-        logging.error(f"{name} {tf_label} {e}")
+        logging.error(f"{name} {tf_label} ERROR {e}")
         return 0
 
 async def main_bot():
     if not BOT_TOKEN or not CHAT_ID:
-        logging.warning("No tokens")
+        logging.warning("No tokens - waiting")
         while True: await asyncio.sleep(3600)
     bot=Bot(token=BOT_TOKEN)
-    await bot.send_message(chat_id=CHAT_ID, text=f"V4.4 LIVE - Pragove {MIN_DROP_PCT}% / {MIN_DELTA_PCT}% - TF 1m,5m,15m,1h,4h,1D - Shte izvestyavam za vsichko!")
-    logging.info("Bot V4.4 started")
+    await bot.send_message(chat_id=CHAT_ID, text=f"V4.5 FIXED LIVE - Pragove {MIN_DROP_PCT}% / {MIN_DELTA_PCT}% - TF 1m,5m,15m,1h,4h,1D - 78 proverki na cikal - Fixed 2-dni bug")
+    logging.info("Bot V4.5 FIXED started")
     while True:
         total_signals = 0
         total_checks = len(TFS) * len(SYMBOLS)
+        start = datetime.now()
         for tf_label,period,interval in TFS:
             for name,ticker in SYMBOLS.items():
                 s = await scan(bot,name,ticker,tf_label,period,interval)
                 total_signals += s
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.8)
+        elapsed = (datetime.now()-start).seconds
         if total_signals == 0:
-            log_msg = f"CIKAL ZAVYRSHEN: NYAMA OTKRITI - Provereni {total_checks} - {datetime.now().strftime('%H:%M:%S')}"
+            log_msg = f"CIKAL ZAVYRSHEN: NYAMA OTKRITI | Provereni {total_checks} | Vreme {elapsed}s | {datetime.now().strftime('%H:%M:%S')}"
             logging.info(log_msg)
             if SEND_EMPTY_CYCLE:
                 try:
-                    txt = f"Cikal zavyrshen: NYAMA otkriti divergencii. Provereni {total_checks} instrumenta x timeframe. Vreme {datetime.now().strftime('%H:%M:%S')}. Sledvasht cikal sled 60 sek."
+                    txt = f"Cikal zavyrshen: NYAMA otkriti. Provereni {total_checks}. Vreme {elapsed}s."
                     await bot.send_message(chat_id=CHAT_ID, text=txt)
-                except Exception as e:
-                    logging.error(f"Telegram send error {e}")
+                except: pass
         else:
-            log_msg = f"Cikal zavyrshen: NAMERENI {total_signals} signala - Sleep 60s"
-            logging.info(log_msg)
-            try:
-                txt2 = f"Cikal zavyrshen: NAMERENI {total_signals} signala! Provereni {total_checks}."
-                await bot.send_message(chat_id=CHAT_ID, text=txt2)
-            except: pass
+            logging.info(f"Cikal zavyrshen: NAMERENI {total_signals} signala | {elapsed}s")
         await asyncio.sleep(60)
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path == "/health":
-            self.send_response(200); self.end_headers(); self.wfile.write(b"Bot V4.4 OK")
+            self.send_response(200); self.end_headers(); self.wfile.write(b"Bot V4.5 FIXED OK - 10pct")
         else:
             self.send_response(404); self.end_headers(); self.wfile.write(b"Not Found")
     def log_message(self, format, *args): return
