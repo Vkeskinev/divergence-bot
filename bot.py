@@ -1,4 +1,4 @@
-import os, asyncio, threading, logging, http.server, socketserver
+import os, asyncio, threading, logging, http.server, socketserver, traceback
 import pandas as pd, numpy as np, yfinance as yf
 from telegram import Bot
 from datetime import datetime, timedelta
@@ -18,9 +18,10 @@ SYMBOLS = {
 }
 TFS = [("1m","1d","1m"),("5m","5d","5m"),("15m","5d","15m"),("1h","1mo","60m"),("4h","3mo","60m"),("1D","1y","1d")]
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', force=True)
 sent_cache = {}
 CACHE_TTL_HOURS = 12
+cycle_count = 0
 
 def calc(df, rolling=100):
     if 'Volume' not in df.columns or df['Volume'].sum()==0:
@@ -66,16 +67,26 @@ def detect_both(df):
                     return {"type":"BULLISH","title":"BICHI NATRUPVANE","price1":low[p1],"price2":low[p2],"vol1":cumSell[s1],"vol2":cumSell[s2],"drop":drop,"delta_max":min_delta,"delta_curr":delta[s2],"delta_drop":delta_rise,"time":df.index[p2]}
     return None
 
+def _download_sync(ticker, period, interval):
+    return yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, threads=False, timeout=15)
+
 async def scan(bot, name, ticker, tf_label, period, interval):
     global sent_cache
+    logging.info(f"START scan {name} {tf_label}")
     try:
-        # почисти стар кеш
         now = datetime.now()
         for k in list(sent_cache.keys()):
             if now - sent_cache[k] > timedelta(hours=CACHE_TTL_HOURS):
                 del sent_cache[k]
-        df=yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True, threads=False, timeout=20)
-        if df.empty:
+        try:
+            df = await asyncio.wait_for(asyncio.to_thread(_download_sync, ticker, period, interval), timeout=25)
+        except asyncio.TimeoutError:
+            logging.error(f"TIMEOUT {name} {tf_label} - Yahoo zabavi >25s, pre-skacam")
+            return 0
+        except Exception as e:
+            logging.error(f"DOWNLOAD FAIL {name} {tf_label} {e}")
+            return 0
+        if df is None or df.empty:
             logging.info(f"Scan {name} {tf_label} - empty")
             return 0
         if isinstance(df.columns, pd.MultiIndex): df.columns=df.columns.get_level_values(0)
@@ -89,49 +100,70 @@ async def scan(bot, name, ticker, tf_label, period, interval):
                 return 0
             sent_cache[key]=now
             msg = f"{sig['title']} | {name} {tf_label} | Price {sig['price1']:.5f} -> {sig['price2']:.5f} | Vol {sig['vol1']:.0f} -> {sig['vol2']:.0f} (-{sig['drop']:.1f}%) | Delta {sig['delta_max']:.0f} -> {sig['delta_curr']:.0f} | Time {sig['time']}"
-            await bot.send_message(chat_id=CHAT_ID, text=msg)
+            try:
+                await asyncio.wait_for(bot.send_message(chat_id=CHAT_ID, text=msg), timeout=15)
+            except Exception as e:
+                logging.error(f"TELEGRAM SEND FAIL {e}")
             logging.info(f"SIGNAL {name} {tf_label} {sig['type']} {sig['drop']:.1f}%")
             return 1
         else:
             logging.info(f"Scan {name} {tf_label} - no signal")
             return 0
     except Exception as e:
-        logging.error(f"{name} {tf_label} ERROR {e}")
+        logging.error(f"{name} {tf_label} ERROR {e} {traceback.format_exc()[:500]}")
         return 0
 
+async def heartbeat():
+    c = 0
+    while True:
+        c += 1
+        logging.info(f"HEARTBEAT #{c} - bot zhiv, cikyl {cycle_count}, cache {len(sent_cache)} - {datetime.now().strftime('%H:%M:%S')}")
+        await asyncio.sleep(60)
+
 async def main_bot():
+    global cycle_count
     if not BOT_TOKEN or not CHAT_ID:
         logging.warning("No tokens - waiting")
         while True: await asyncio.sleep(3600)
     bot=Bot(token=BOT_TOKEN)
-    await bot.send_message(chat_id=CHAT_ID, text=f"V4.5 FIXED LIVE - Pragove {MIN_DROP_PCT}% / {MIN_DELTA_PCT}% - TF 1m,5m,15m,1h,4h,1D - 78 proverki na cikal - Fixed 2-dni bug")
-    logging.info("Bot V4.5 FIXED started")
+    asyncio.create_task(heartbeat())
+    try:
+        await asyncio.wait_for(bot.send_message(chat_id=CHAT_ID, text=f"V4.6 FIXED LIVE - Pragove {MIN_DROP_PCT}% / {MIN_DELTA_PCT}% - TF 1m,5m,15m,1h,4h,1D - 78 proverki - Timeout 25s + Heartbeat - Ne zabiva veche!"), timeout=15)
+    except Exception as e:
+        logging.error(f"Start msg fail {e}")
+    logging.info("Bot V4.6 FIXED started")
     while True:
-        total_signals = 0
-        total_checks = len(TFS) * len(SYMBOLS)
-        start = datetime.now()
-        for tf_label,period,interval in TFS:
-            for name,ticker in SYMBOLS.items():
-                s = await scan(bot,name,ticker,tf_label,period,interval)
-                total_signals += s
-                await asyncio.sleep(0.8)
-        elapsed = (datetime.now()-start).seconds
-        if total_signals == 0:
-            log_msg = f"CIKAL ZAVYRSHEN: NYAMA OTKRITI | Provereni {total_checks} | Vreme {elapsed}s | {datetime.now().strftime('%H:%M:%S')}"
-            logging.info(log_msg)
-            if SEND_EMPTY_CYCLE:
-                try:
-                    txt = f"Cikal zavyrshen: NYAMA otkriti. Provereni {total_checks}. Vreme {elapsed}s."
-                    await bot.send_message(chat_id=CHAT_ID, text=txt)
-                except: pass
-        else:
-            logging.info(f"Cikal zavyrshen: NAMERENI {total_signals} signala | {elapsed}s")
-        await asyncio.sleep(60)
+        try:
+            cycle_count += 1
+            total_signals = 0
+            total_checks = len(TFS) * len(SYMBOLS)
+            start = datetime.now()
+            logging.info(f"=== START CIKAL #{cycle_count} - {total_checks} proverki - {start.strftime('%H:%M:%S')} ===")
+            for tf_label,period,interval in TFS:
+                for name,ticker in SYMBOLS.items():
+                    s = await scan(bot,name,ticker,tf_label,period,interval)
+                    total_signals += s
+                    await asyncio.sleep(0.3)
+            elapsed = (datetime.now()-start).seconds
+            if total_signals == 0:
+                logging.info(f"CIKAL #{cycle_count} ZAVYRSHEN: NYAMA OTKRITI | Provereni {total_checks} | Vreme {elapsed}s | {datetime.now().strftime('%H:%M:%S')}")
+                if SEND_EMPTY_CYCLE:
+                    try:
+                        txt = f"Cikal {cycle_count} zavyrshen: NYAMA otkriti. Provereni {total_checks}."
+                        await bot.send_message(chat_id=CHAT_ID, text=txt)
+                    except: pass
+            else:
+                logging.info(f"Cikal #{cycle_count} zavyrshen: NAMERENI {total_signals} signala | {elapsed}s")
+            logging.info(f"Sleep 60s predi cikal #{cycle_count+1}")
+            await asyncio.sleep(60)
+        except Exception as e:
+            logging.error(f"MAIN LOOP ERROR - restart sled 10s: {e} {traceback.format_exc()[:800]}")
+            await asyncio.sleep(10)
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path == "/health":
-            self.send_response(200); self.end_headers(); self.wfile.write(b"Bot V4.5 FIXED OK - 10pct")
+            self.send_response(200); self.end_headers(); self.wfile.write(f"Bot V4.6 OK - cikal {cycle_count}".encode())
         else:
             self.send_response(404); self.end_headers(); self.wfile.write(b"Not Found")
     def log_message(self, format, *args): return
